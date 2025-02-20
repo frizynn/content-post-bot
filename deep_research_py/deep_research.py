@@ -2,15 +2,17 @@ from typing import List, Dict, TypedDict, Optional
 import asyncio
 import os
 import openai
+import time
 from firecrawl import FirecrawlApp
-from .ai.providers import trim_prompt, generate_completions
-from .prompt import system_prompt
-from .common.logging import log_event, log_error
-from .common.token_cunsumption import (
+from deep_research_py.ai.providers import trim_prompt, generate_completions
+from deep_research_py.prompt import system_prompt
+from deep_research_py.common.logging import log_event, log_error, log_warning
+from deep_research_py.common.token_cunsumption import (
     parse_ollama_token_consume,
     parse_openai_token_consume,
 )
-from .utils import get_service
+from deep_research_py.utils import get_service
+from deep_research_py.utils.retry import retry_with_exponential_backoff
 import json
 from pydantic import BaseModel
 
@@ -30,58 +32,61 @@ class SerpQuery(BaseModel):
 
 
 class Firecrawl:
-    """Simple wrapper for Firecrawl SDK."""
+    """Simple wrapper for Firecrawl SDK with rate limiting."""
 
     def __init__(self, api_key: str = "", api_url: Optional[str] = None):
         self.app = FirecrawlApp(api_key=api_key, api_url=api_url)
+        self.last_request_time = 0
+        self.min_request_interval = 2.0  # Increased minimum time between requests
+        self.max_retries = 5  # Increased max retries
+        self.base_delay = 2
 
+    async def _wait_for_rate_limit(self):
+        """Implements rate limiting between requests."""
+        now = time.time()
+        time_since_last_request = now - self.last_request_time
+        if time_since_last_request < self.min_request_interval:
+            await asyncio.sleep(self.min_request_interval - time_since_last_request)
+        self.last_request_time = time.time()
+
+    @retry_with_exponential_backoff(max_retries=5, base_delay=2.0, retry_on=(429,))
     async def search(
         self, query: str, timeout: int = 15000, limit: int = 5
     ) -> SearchResponse:
-        """Search using Firecrawl SDK in a thread pool to keep it async."""
-        try:
-            # Run the synchronous SDK call in a thread pool
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.app.search(
-                    query=query,
-                ),
-            )
+        """Search using Firecrawl SDK with retry logic."""
+        await self._wait_for_rate_limit()
+        
+        # Run the synchronous SDK call in a thread pool
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: self.app.search(
+                query=query,
+            ),
+        )
 
-            # Handle the response format from the SDK
-            if isinstance(response, dict) and "data" in response:
-                # Response is already in the right format
-                return response
-            elif isinstance(response, dict) and "success" in response:
-                # Response is in the documented format
-                return {"data": response.get("data", [])}
-            elif isinstance(response, list):
-                # Response is a list of results
-                formatted_data = []
-                for item in response:
-                    if isinstance(item, dict):
-                        formatted_data.append(item)
-                    else:
-                        # Handle non-dict items (like objects)
-                        formatted_data.append(
-                            {
-                                "url": getattr(item, "url", ""),
-                                "markdown": getattr(item, "markdown", "")
-                                or getattr(item, "content", ""),
-                                "title": getattr(item, "title", "")
-                                or getattr(item, "metadata", {}).get("title", ""),
-                            }
-                        )
-                return {"data": formatted_data}
-            else:
-                print(f"Unexpected response format from Firecrawl: {type(response)}")
-                return {"data": []}
-
-        except Exception as e:
-            print(f"Error searching with Firecrawl: {e}")
-            print(
-                f"Response type: {type(response) if 'response' in locals() else 'N/A'}"
-            )
+        # Handle the response format from the SDK
+        if isinstance(response, dict) and "data" in response:
+            return response
+        elif isinstance(response, dict) and "success" in response:
+            return {"data": response.get("data", [])}
+        elif isinstance(response, list):
+            formatted_data = []
+            for item in response:
+                if isinstance(item, dict):
+                    formatted_data.append(item)
+                else:
+                    formatted_data.append(
+                        {
+                            "url": getattr(item, "url", ""),
+                            "markdown": getattr(item, "markdown", "")
+                            or getattr(item, "content", ""),
+                            "title": getattr(item, "title", "")
+                            or getattr(item, "metadata", {}).get("title", ""),
+                        }
+                    )
+            return {"data": formatted_data}
+        else:
+            print(f"Unexpected response format from Firecrawl: {type(response)}")
             return {"data": []}
 
 
@@ -220,6 +225,9 @@ async def write_final_report(
     model: str,
 ) -> str:
     """Generate final report based on all research learnings."""
+    
+    log_event("Starting to generate final report...")
+    log_event(f"Processing {len(learnings)} learnings from {len(visited_urls)} sources")
 
     learnings_string = trim_prompt(
         "\n".join([f"<learning>\n{learning}\n</learning>" for learning in learnings]),
@@ -234,19 +242,26 @@ async def write_final_report(
         f"Here are all the learnings from research:\n\n<learnings>\n{learnings_string}\n</learnings>"
     )
 
+    log_event("Generating final report content...")
     messages = [{"role": "user", "content": user_prompt}]
     
-    response = await generate_completions(
-        client=client,
-        model=model,
-        messages=messages,
-        format={"type": "json_object"}
-    )
+    try:
+        response = await generate_completions(
+            client=client,
+            model=model,
+            messages=messages,
+            format={"type": "json_object"}
+        )
 
-    if get_service() == "ollama":
-        return response["message"]["content"]
-    else:
-        return response.choices[0].message.content
+        log_event("Final report generated successfully")
+        
+        if get_service() == "ollama":
+            return response["message"]["content"]
+        else:
+            return response.choices[0].message.content
+    except Exception as e:
+        log_error(f"Error generating final report: {str(e)}")
+        raise
 
 
 async def deep_research(
@@ -261,18 +276,15 @@ async def deep_research(
 ) -> ResearchResult:
     """
     Main research function that recursively explores a topic.
-
-    Args:
-        query: Research query/topic
-        breadth: Number of parallel searches to perform
-        depth: How many levels deep to research
-        learnings: Previous learnings to build upon
-        visited_urls: Previously visited URLs
     """
     learnings = learnings or []
     visited_urls = visited_urls or []
 
+    log_event(f"Starting research for query: {query}")
+    log_event(f"Current depth: {depth}, breadth: {breadth}, concurrency: {concurrency}")
+
     # Generate search queries
+    log_event("Generating search queries...")
     serp_queries = await generate_serp_queries(
         query=query,
         client=client,
@@ -281,13 +293,22 @@ async def deep_research(
         learnings=learnings,
     )
 
+    if not serp_queries:
+        log_warning("No search queries generated, research may be incomplete")
+
     # Create a semaphore to limit concurrent requests
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def process_query(serp_query: SerpQuery) -> ResearchResult:
+    async def process_query(serp_query: SerpQuery, query_index: int) -> ResearchResult:
         async with semaphore:
             try:
+                log_event(f"Processing query {query_index + 1}/{len(serp_queries)}: {serp_query.query}")
+                
+                # Add delay based on query index to stagger requests
+                await asyncio.sleep(query_index * 2)
+                
                 # Search for content
+                log_event(f"Searching content for: {serp_query.query}")
                 result = await firecrawl.search(
                     serp_query.query, timeout=15000, limit=5
                 )
@@ -296,12 +317,15 @@ async def deep_research(
                 new_urls = [
                     item.get("url") for item in result["data"] if item.get("url")
                 ]
+                if new_urls:
+                    log_event(f"Found {len(new_urls)} new sources")
 
                 # Calculate new breadth and depth for next iteration
                 new_breadth = max(1, breadth // 2)
                 new_depth = depth - 1
 
                 # Process the search results
+                log_event("Processing search results...")
                 new_learnings = await process_serp_result(
                     query=serp_query.query,
                     search_result=result,
@@ -313,11 +337,13 @@ async def deep_research(
                 all_learnings = learnings + new_learnings["learnings"]
                 all_urls = visited_urls + new_urls
 
-                # If we have more depth to go, continue research
+                # If we have more depth to go, continue research with delay
                 if new_depth > 0:
-                    print(
-                        f"Researching deeper, breadth: {new_breadth}, depth: {new_depth}"
+                    log_event(
+                        f"Research level {new_depth}: Breadth={new_breadth}"
                     )
+                    # Add delay before going deeper
+                    await asyncio.sleep(3)
 
                     next_query = f"""
                     Previous research goal: {serp_query.research_goal}
@@ -328,7 +354,7 @@ async def deep_research(
                         query=next_query,
                         breadth=new_breadth,
                         depth=new_depth,
-                        concurrency=concurrency,
+                        concurrency=max(1, concurrency - 1),
                         learnings=all_learnings,
                         visited_urls=all_urls,
                         client=client,
@@ -339,19 +365,25 @@ async def deep_research(
 
             except Exception as e:
                 if "Timeout" in str(e):
-                    print(f"Timeout error running query: {serp_query.query}: {e}")
+                    log_error(f"Timeout error for query '{serp_query.query}': {str(e)}")
                 else:
-                    print(f"Error running query: {serp_query.query}: {e}")
+                    log_error(f"Error processing query '{serp_query.query}': {str(e)}")
                 return {"learnings": [], "visited_urls": []}
 
-    # Process all queries concurrently
-    results = await asyncio.gather(*[process_query(query) for query in serp_queries])
+    # Process queries with index for staggered delays
+    log_event(f"Processing {len(serp_queries)} queries in parallel...")
+    results = await asyncio.gather(*[
+        process_query(query, idx) 
+        for idx, query in enumerate(serp_queries)
+    ])
 
     # Combine all results
     all_learnings = list(
         set(learning for result in results for learning in result["learnings"])
     )
+    log_event(f"Collected {len(all_learnings)} unique findings")
 
     all_urls = list(set(url for result in results for url in result["visited_urls"]))
+    log_event(f"Total unique sources: {len(all_urls)}")
 
     return {"learnings": all_learnings, "visited_urls": all_urls}

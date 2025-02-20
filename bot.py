@@ -2,19 +2,23 @@ import asyncio
 from deep_research_py.deep_research import deep_research, write_final_report
 from deep_research_py.ai.providers import get_ai_client
 from deep_research_py.utils import set_service, set_model, get_model
+from deep_research_py.common.logging import initial_logger
 
 async def generate_research_report(query: str):
+    # Initialize logger with stdout enabled
+    initial_logger(enable_stdout=True)
+    
     # Configure the service and model
     set_service("openai")  
-    set_model("o3-mini")  # Or your preferred model
+    set_model("o3-mini")  
 
     # Get the AI client
     client = get_ai_client()
     
-    # Research parameters
-    breadth = 4  # Number of parallel searches
-    depth = 2    # How deep to go in the research
-    concurrency = 2  # Number of concurrent requests
+    # Research parameters - more conservative to avoid rate limiting
+    breadth = 1  # Reduced number of parallel searches
+    depth = 1    # Maintain depth but with reduced concurrency
+    concurrency = 1  # Single concurrent request to avoid rate limits
 
     # Do the research
     research_results = await deep_research(
@@ -25,6 +29,8 @@ async def generate_research_report(query: str):
         client=client,
         model=get_model(),
     )
+
+    # Add delay before generating final report
 
     # Generate the final report
     report = await write_final_report(
