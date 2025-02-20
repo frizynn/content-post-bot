@@ -2,39 +2,31 @@ import asyncio
 import os
 import typer
 import tiktoken
-from typing import Optional
+from typing import Optional, Dict, Any
+from pydantic import BaseModel
 from dotenv import load_dotenv
+from openai import OpenAI
 from .text_splitter import RecursiveCharacterTextSplitter
 
 from deep_research_py.utils import console, get_service, get_model
-
-# Assuming we're using OpenAI's API
-import openai
 
 import ollama
 
 load_dotenv()
 
+class JsonResponse(BaseModel):
+    reportMarkdown: str
 
-def create_openai_client(api_key: str, base_url: Optional[str] = None) -> openai.OpenAI:
-    return openai.OpenAI(
-        api_key=api_key, base_url=base_url or "https://api.openai.com/v1"
-    )
+def create_openai_client(api_key: str, base_url: Optional[str] = None) -> OpenAI:
+    return OpenAI(api_key=api_key, base_url=base_url or "https://api.openai.com/v1")
 
-
-def create_deepseek_client(
-    api_key: str, base_url: Optional[str] = None
-) -> openai.OpenAI:
-    return openai.OpenAI(
-        api_key=api_key, base_url=base_url or "https://api.deepseek.com/v1"
-    )
-
+def create_deepseek_client(api_key: str, base_url: Optional[str] = None) -> OpenAI:
+    return OpenAI(api_key=api_key, base_url=base_url or "https://api.deepseek.com/v1")
 
 def create_ollama_client(host: Optional[str] = None) -> ollama.Client:
     return ollama.Client(host=host)
 
-
-def get_ai_client() -> openai.OpenAI:
+def get_ai_client() -> OpenAI:
     # Decide which API key and endpoint to use
     service = get_service()
     if service.lower() == "openai":
@@ -65,9 +57,7 @@ def get_ai_client() -> openai.OpenAI:
         )
         raise typer.Exit(1)
 
-
 MIN_CHUNK_SIZE = 140
-
 
 def get_token_count(text: str) -> int:
     """Returns the number of tokens in a given text."""
@@ -86,7 +76,6 @@ def get_token_count(text: str) -> int:
         # For Ollama, we can use the same encoding as OpenAI
         client = get_ai_client()
         return len(client.embed(model=get_model(), input=text)["embeddings"][0])
-
 
 def trim_prompt(
     prompt: str, context_size: int = int(os.getenv("CONTEXT_SIZE", "128000"))
@@ -117,7 +106,6 @@ def trim_prompt(
 
     return trim_prompt(trimmed_prompt, context_size)
 
-
 async def generate_completions(client, model, messages, format):
     if get_service() == "ollama":
         response = await asyncio.get_event_loop().run_in_executor(
@@ -131,7 +119,9 @@ async def generate_completions(client, model, messages, format):
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: client.chat.completions.create(
-                model=model, messages=messages, response_format=format
+                model=model, 
+                messages=messages,
+                response_format={"type": "json_object"}
             ),
         )
     return response

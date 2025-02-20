@@ -121,14 +121,10 @@ async def generate_serp_queries(
     )
 
     try:
-        if get_service() == "ollama":
-            result = SerpQueryResponse.model_validate_json(response.message.content)
-            parse_ollama_token_consume("generate_serp_queries", response)
-        else:
-            result = SerpQueryResponse.model_validate_json(
-                response.choices[0].message.content
-            )
-            parse_openai_token_consume("generate_serp_queries", response)
+        result = SerpQueryResponse.model_validate_json(
+            response.choices[0].message.content
+        )
+        parse_openai_token_consume("generate_serp_queries", response)
 
         queries = result.queries if result.queries else []
         log_event(f"Generated {len(queries)} SERP queries for research query: {query}")
@@ -187,14 +183,11 @@ async def process_serp_result(
     )
 
     try:
-        if get_service() == "ollama":
-            result = SerpResultResponse.model_validate_json(response.message.content)
-            parse_ollama_token_consume("process_serp_result", response)
-        else:
-            result = SerpResultResponse.model_validate_json(
-                response.choices[0].message.content
-            )
-            parse_openai_token_consume("process_serp_result", response)
+       
+        result = SerpResultResponse.model_validate_json(
+            response.choices[0].message.content
+        )
+        parse_openai_token_consume("process_serp_result", response)
 
         log_event(
             f"Processed SERP results for query: {query}, found {len(result.learnings)} learnings and {len(result.followUpQuestions)} follow-up questions"
@@ -241,42 +234,19 @@ async def write_final_report(
         f"Here are all the learnings from research:\n\n<learnings>\n{learnings_string}\n</learnings>"
     )
 
+    messages = [{"role": "user", "content": user_prompt}]
+    
     response = await generate_completions(
         client=client,
         model=model,
-        messages=[
-            {"role": "system", "content": system_prompt()},
-            {"role": "user", "content": user_prompt},
-        ],
-        format=FinalReportResponse.model_json_schema(),
+        messages=messages,
+        format={"type": "json_object"}
     )
 
-    try:
-        if get_service() == "ollama":
-            result = FinalReportResponse.model_validate_json(response.message.content)
-            parse_ollama_token_consume("write_final_report", response)
-        else:
-            result = FinalReportResponse.model_validate_json(
-                response.choices[0].message.content
-            )
-            parse_openai_token_consume("write_final_report", response)
-
-        report = result.reportMarkdown if result.reportMarkdown else ""
-        log_event(
-            f"Generated final report based on {len(learnings)} learnings from {len(visited_urls)} sources"
-        )
-        # Append sources
-        urls_section = "\n\n## Sources\n\n" + "\n".join(
-            [f"- {url}" for url in visited_urls]
-        )
-        return report + urls_section
-    except json.JSONDecodeError as e:
-        print(f"Error parsing JSON response: {e}")
-        print(f"Raw response: {response.choices[0].message.content}")
-        log_error(
-            f"Failed to generate final report for research query, raw response: {response.choices[0].message.content}"
-        )
-        return "Error generating report"
+    if get_service() == "ollama":
+        return response["message"]["content"]
+    else:
+        return response.choices[0].message.content
 
 
 async def deep_research(
